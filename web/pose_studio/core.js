@@ -6,6 +6,7 @@
 
 
 import { normalizeCaptureLens } from "./animation.mjs?v=20261105.1";
+import { PoseStudioFloor, floorHeightForLowestPoints, lowestSkinnedPointY, normalizeFloorSettings } from "./floor.mjs?v=20261119.1";
 
 // Determine the extension's base URL dynamically to support varied directory names
 const EXTENSION_URL = new URL(".", import.meta.url).toString();
@@ -1391,6 +1392,8 @@ export class PoseViewerCore {
         }
 
         if (this.renderer) {
+            this.floor?.dispose();
+            this.floor = null;
             this.renderer.dispose();
             if (this.renderer.domElement && this.renderer.domElement.parentNode) {
                 // Don't modify the shell's DOM, just clean up WebGL
@@ -1626,6 +1629,61 @@ export class PoseViewerCore {
 
         this.hoveredBoneName = null;
         this.directDrag = { active: false, chainKey: null, effector: null, effectorBone: null, plane: null, offset: null, hasDragged: false, clickedBone: null, startClientX: 0, startClientY: 0 };
+
+        this.floor = new PoseStudioFloor(THREE, this.scene);
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        this.setFloorSettings(this.floorSettings);
+    }
+
+    // === Floor ===
+
+    setFloorSettings(settings) {
+        this.floorSettings = normalizeFloorSettings(settings);
+        if (!this.floor) return this.floorSettings;
+        this.floor.apply(this.floorSettings);
+        // capture() and the interaction overlay already hide `gridHelper`.
+        this.gridHelper = this.floor.editorOnlyGrid;
+        this.requestRender();
+        return this.floorSettings;
+    }
+
+    getFloorHeight() {
+        return this.floor ? this.floor.height : (this.floorSettings?.height ?? 0);
+    }
+
+    _characterMeshes() {
+        return [
+            this.skinnedMesh,
+            ...Array.from(this.passiveCharacters?.values?.() || [], entry => entry.mesh),
+        ].filter(Boolean);
+    }
+
+    /** Lowest skinned point of one character (null id = the active one). */
+    characterLowestPoint(id = null) {
+        if (!this.THREE) return null;
+        const mesh = id == null
+            ? this.skinnedMesh
+            : this.passiveCharacters?.get(String(id))?.mesh;
+        return mesh ? lowestSkinnedPointY(this.THREE, mesh) : null;
+    }
+
+    /** Floor height touching the lowest visible character. */
+    floorHeightForCharacters() {
+        if (!this.THREE) return null;
+        return floorHeightForLowestPoints(
+            this._characterMeshes()
+                .filter(mesh => mesh.visible)
+                .map(mesh => lowestSkinnedPointY(this.THREE, mesh)),
+        );
+    }
+
+    _prepareFloorForRender() {
+        if (!this.floor || !this.renderer) return;
+        const shadows = this.floor.castsShadows;
+        this.renderer.shadowMap.enabled = shadows;
+        if (!shadows) return;
+        const keyLight = (this.lights || []).find(light => light?.isDirectionalLight && light.intensity > 0);
+        this.floor.updateShadowFrame(this._characterMeshes(), keyLight?.position || null);
     }
 
     _createDirectionalSkydome() {
@@ -1868,6 +1926,7 @@ export class PoseViewerCore {
         if (this._needsRender || dampingChanged) {
             this._needsRender = false;
             if (this.renderer) {
+                this._prepareFloorForRender();
                 this.renderer.render(this.scene, this.camera);
                 this.options.onViewportRender?.();
             }
@@ -5785,7 +5844,7 @@ export class PoseViewerCore {
 
     renderInteractionOverlay() {
         if (!this.initialized || !this.renderer) return;
-        const hidden = [this.skinnedMesh, this.gridHelper, this.captureFrame, this.refPlane,
+        const hidden = [this.skinnedMesh, this.gridHelper, this.captureFrame, this.refPlane, this.floor?.group,
             ...Array.from(this.passiveCharacters?.values?.() || [], entry => entry.mesh)];
         const visibility = hidden.map(item => item?.visible);
         const background = this.scene.background;
@@ -5868,6 +5927,7 @@ export class PoseViewerCore {
             this.beginCaptureBatch(width, height);
             // Render with Fixed Camera
             const camera = options.viewport ? this.camera : this.captureCamera;
+            this._prepareFloorForRender();
             this.renderer.render(this.scene, camera);
             if (options.targetCanvas) {
                 const target = options.targetCanvas;

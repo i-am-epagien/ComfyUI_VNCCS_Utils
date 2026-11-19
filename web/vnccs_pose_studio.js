@@ -10,7 +10,7 @@ import {
     POSE_STUDIO_CAPTURE_FOV,
     PoseViewerCore,
     buildEquivalentPerspectiveProjectionFrame,
-} from "./pose_studio/core.js?v=20261107.1";
+} from "./pose_studio/core.js?v=20261119.1";
 import {
     cameraPromptToSkydomeRotation,
 } from "./camera_control/utils.mjs";
@@ -37,6 +37,13 @@ import {
 } from "./pose_studio/characters.mjs?v=20261107.1";
 import { CHARACTER_POSITION_LIMITS, clampCharacterPosition, modelRotationQuaternion, wrapDegrees } from "./pose_studio/character_transform.mjs?v=20261107.1";
 import { PoseCharacterTransformController } from "./pose_studio/character_transform_controller.mjs?v=20261107.4";
+import {
+    DEFAULT_FLOOR_SETTINGS,
+    FLOOR_HEIGHT_LIMITS,
+    clampFloorHeight,
+    groundingDeltaY,
+    normalizeFloorSettings,
+} from "./pose_studio/floor.mjs?v=20261119.1";
 import {
     MAX_VIDEO_POSE_SAMPLES,
     canvasToBlob,
@@ -4454,6 +4461,7 @@ class PoseStudioWidget {
             animation_image_batch: false,
             hand_controls_v2: true,
             directional_skydome_enabled: false,
+            floor: { ...DEFAULT_FLOOR_SETTINGS },
         };
 
         const primaryCharacter = createPoseStudioCharacter({
@@ -4581,6 +4589,7 @@ class PoseStudioWidget {
         this.createUI();
         this.setSkydomeFromCameraPrompt("", { force: true });
         this.applyDirectionalSkydomeSetting();
+        this.applyFloorSetting();
     }
 
     dispose() {
@@ -6408,6 +6417,8 @@ class PoseStudioWidget {
         lightSection.content.appendChild(this.lightListContainer);
         rightSidebar.appendChild(lightSection.el);
 
+        this.createFloorSection(rightSidebar);
+
         // Prompt Section
         const promptSection = this.createSection("Prompt", true);
         const promptArea = document.createElement("textarea");
@@ -6941,6 +6952,7 @@ class PoseStudioWidget {
         }
         this.renderCharactersUI();
         await this.selectCharacter(character.id);
+        this.autoGroundCharacters([character.id]);
         return true;
     }
 
@@ -7574,6 +7586,273 @@ class PoseStudioWidget {
             rotation.pitchDegrees,
         );
         return true;
+    }
+
+    // === Floor ===
+
+    get floorSettings() {
+        if (!this.exportParams.floor || typeof this.exportParams.floor !== "object") {
+            this.exportParams.floor = normalizeFloorSettings(DEFAULT_FLOOR_SETTINGS);
+        }
+        return this.exportParams.floor;
+    }
+
+    applyFloorSetting() {
+        this.exportParams.floor = normalizeFloorSettings(this.exportParams.floor);
+        this.viewer?.setFloorSettings?.(this.exportParams.floor);
+        this.syncFloorControls?.();
+        return this.exportParams.floor;
+    }
+
+    /**
+     * Update floor settings with immediate viewport feedback. The node sync
+     * skips the capture (execution always re-captures), so it is cheap enough
+     * to run on every input event of a continuous gesture.
+     */
+    updateFloorSettings(patch = {}) {
+        this.exportParams.floor = normalizeFloorSettings({ ...this.floorSettings, ...patch });
+        this.applyFloorSetting();
+        this.syncToNode(false, { skipCapture: true });
+    }
+
+    /** Move the floor to the lowest point of all characters. */
+    fitFloorToCharacters() {
+        const height = this.viewer?.floorHeightForCharacters?.();
+        if (height == null) return false;
+        this.updateFloorSettings({ height });
+        return true;
+    }
+
+    /**
+     * Move characters vertically so their lowest skinned point rests on the
+     * floor. Uses the same placement paths as the position controls, so Image
+     * mode stores the result in the current pose tab and Animation mode keys
+     * the current frame when Auto-Key is enabled.
+     */
+    snapCharactersToFloor(ids = null, { recordHistory = true } = {}) {
+        if (!this.viewer?.isInitialized?.() || !this.floorSettings.enabled) return 0;
+        const floorY = this.viewer.getFloorHeight();
+        const targets = ids ? this.characters.filter(character => ids.includes(character.id)) : this.characters;
+        if (!targets.length) return 0;
+        if (recordHistory && !this.isAnimationMode()) this.viewer.recordState?.();
+        let moved = 0;
+        let clamped = false;
+        for (const character of targets) {
+            const isActive = character.id === this.activeCharacterId;
+            const lowest = this.viewer.characterLowestPoint(isActive ? null : character.id);
+            const delta = groundingDeltaY(lowest, floorY);
+            if (Math.abs(delta) < 1e-4) continue;
+            if (isActive) {
+                const targetY = (Number(this.exportParams.cam_offset_y) || 0) + delta;
+                if (this.applyCharacterPosition({
+                    x: this.exportParams.cam_offset_x,
+                    y: targetY,
+                    z: character.transform?.z,
+                }, { link: false })) moved += 1;
+                if (Math.abs((Number(this.exportParams.cam_offset_y) || 0) - targetY) > 1e-4) clamped = true;
+            } else {
+                const transform = this.passiveCharacterPosition(character);
+                const next = clampCharacterPosition({ ...transform, y: transform.y + delta });
+                if (Math.abs(next.y - (transform.y + delta)) > 1e-4) clamped = true;
+                this.applyPassiveCharacterPlacement(character, { transform: { ...transform, ...next } });
+                moved += 1;
+            }
+        }
+        if (moved) {
+            this.updateCharacterScene();
+            this.syncCameraWidgets();
+            this.syncToNode(false, { skipCapture: true });
+        }
+        if (clamped) {
+            this.showMessage("Some characters could not reach the floor within the position limits. Move the floor closer.", true);
+        }
+        return moved;
+    }
+
+    /** Ground characters changed by a library load or Add Character when enabled. */
+    autoGroundCharacters(ids) {
+        const floor = this.floorSettings;
+        if (!floor.enabled || !floor.auto_ground || this.host?.embedded === true) return 0;
+        return this.snapCharactersToFloor(ids, { recordHistory: false });
+    }
+
+    createFloorSection(parent) {
+        const section = this.createSection("Floor", false);
+        const content = section.content;
+        const controls = {};
+
+        const checkboxRow = (label, hint, key, onChange) => {
+            const row = document.createElement("label");
+            row.className = "vnccs-ps-field";
+            row.style.display = "flex";
+            row.style.flexDirection = "row";
+            row.style.alignItems = "center";
+            row.style.gap = "8px";
+            row.style.cursor = "pointer";
+            row.title = hint;
+            const input = document.createElement("input");
+            input.type = "checkbox";
+            input.onchange = () => onChange(input.checked);
+            const text = document.createElement("span");
+            text.className = "vnccs-ps-label";
+            text.textContent = label;
+            row.append(input, text);
+            controls[key] = input;
+            return row;
+        };
+
+        const sliderRow = (label, key, min, max, step, defaultValue) => {
+            const field = document.createElement("div");
+            field.className = "vnccs-ps-field";
+            const labelRow = document.createElement("div");
+            labelRow.className = "vnccs-ps-label-row";
+            labelRow.style.display = "flex";
+            labelRow.style.justifyContent = "space-between";
+            labelRow.style.alignItems = "center";
+            const labelEl = document.createElement("span");
+            labelEl.className = "vnccs-ps-label";
+            labelEl.textContent = label;
+            const slider = document.createElement("input");
+            slider.type = "range";
+            slider.className = "vnccs-ps-slider";
+            slider.min = String(min);
+            slider.max = String(max);
+            slider.step = String(step);
+            slider.value = String(defaultValue);
+            const valueRow = document.createElement("div");
+            valueRow.style.display = "flex";
+            valueRow.style.alignItems = "center";
+            valueRow.style.gap = "6px";
+            const resetBtn = document.createElement("button");
+            resetBtn.className = "vnccs-ps-reset-btn";
+            resetBtn.innerHTML = "↺";
+            resetBtn.title = `Reset to ${defaultValue}`;
+            resetBtn.onclick = (event) => {
+                event.stopPropagation();
+                slider.value = String(defaultValue);
+                slider.dispatchEvent(new Event("input"));
+            };
+            valueRow.append(this.createSliderNumber(slider, `Floor ${label}`), resetBtn);
+            labelRow.append(labelEl, valueRow);
+            const wrap = document.createElement("div");
+            wrap.className = "vnccs-ps-slider-wrap";
+            wrap.appendChild(slider);
+            field.append(labelRow, wrap);
+            // Realtime: every input event moves the floor in the viewport.
+            slider.addEventListener("input", () => this.updateFloorSettings({ [key]: Number(slider.value) }));
+            controls[key] = slider;
+            return field;
+        };
+
+        const selectRow = (label, key, options) => {
+            const field = document.createElement("div");
+            field.className = "vnccs-ps-field";
+            const labelEl = document.createElement("div");
+            labelEl.className = "vnccs-ps-label";
+            labelEl.textContent = label;
+            const select = document.createElement("select");
+            select.className = "vnccs-ps-select";
+            select.style.width = "100%";
+            for (const [value, text] of options) {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = text;
+                select.appendChild(option);
+            }
+            select.onchange = () => this.updateFloorSettings({ [key]: select.value });
+            field.append(labelEl, select);
+            controls[key] = select;
+            return field;
+        };
+
+        const button = (label, title, onClick) => {
+            const element = document.createElement("button");
+            element.type = "button";
+            element.className = "vnccs-ps-btn";
+            element.style.flex = "1";
+            element.textContent = label;
+            element.title = title;
+            element.onclick = onClick;
+            return element;
+        };
+
+        content.appendChild(checkboxRow(
+            "Show Floor",
+            "Adds a ground plane with contact shadows to the viewport and exported images.",
+            "enabled",
+            (enabled) => {
+                this.updateFloorSettings({ enabled });
+                // First enable: place the floor under the characters instead of through them.
+                if (enabled && this.floorSettings.height == null) this.fitFloorToCharacters();
+            },
+        ));
+
+        const body = document.createElement("div");
+        body.appendChild(sliderRow("Height", "height", FLOOR_HEIGHT_LIMITS[0], FLOOR_HEIGHT_LIMITS[1], 0.01, 0));
+
+        const actions = document.createElement("div");
+        actions.style.display = "flex";
+        actions.style.gap = "6px";
+        actions.style.margin = "4px 0 10px";
+        actions.append(
+            button("To Feet", "Move the floor to the lowest point of all characters", () => this.fitFloorToCharacters()),
+            button("Snap", "Put the selected character on the floor", () => this.snapCharactersToFloor([this.activeCharacterId])),
+            button("Snap All", "Put every character on the floor", () => this.snapCharactersToFloor()),
+        );
+        body.appendChild(actions);
+
+        body.appendChild(checkboxRow(
+            "Auto-ground new poses",
+            "Snap a character to the floor after loading a library pose or adding a character.",
+            "auto_ground",
+            (auto_ground) => this.updateFloorSettings({ auto_ground }),
+        ));
+        body.appendChild(selectRow("Surface", "style", [["solid", "Solid color"], ["shadow", "Shadows only"]]));
+
+        const colorField = document.createElement("div");
+        colorField.className = "vnccs-ps-field";
+        colorField.style.display = "flex";
+        colorField.style.flexDirection = "row";
+        colorField.style.alignItems = "center";
+        colorField.style.justifyContent = "space-between";
+        const colorLabel = document.createElement("span");
+        colorLabel.className = "vnccs-ps-label";
+        colorLabel.textContent = "Color";
+        const colorInput = document.createElement("input");
+        colorInput.type = "color";
+        colorInput.setAttribute("aria-label", "Floor color");
+        colorInput.addEventListener("input", () => this.updateFloorSettings({ color: colorInput.value }));
+        controls.color = colorInput;
+        colorField.append(colorLabel, colorInput);
+        body.appendChild(colorField);
+
+        body.appendChild(checkboxRow("Grid", "Show a 5-unit grid on the floor.", "show_grid",
+            (show_grid) => this.updateFloorSettings({ show_grid })));
+        body.appendChild(checkboxRow("Grid in Export", "Include the grid in exported images.", "grid_in_export",
+            (grid_in_export) => this.updateFloorSettings({ grid_in_export })));
+        body.appendChild(checkboxRow("Shadows", "Cast contact shadows from the characters onto the floor.", "shadows",
+            (shadows) => this.updateFloorSettings({ shadows })));
+        body.appendChild(sliderRow("Shadow Strength", "shadow_opacity", 0, 1, 0.01, DEFAULT_FLOOR_SETTINGS.shadow_opacity));
+        body.appendChild(selectRow("Shadow Direction", "shadow_source", [["overhead", "Overhead"], ["key", "Key light"]]));
+        content.appendChild(body);
+
+        this.syncFloorControls = () => {
+            const floor = this.floorSettings;
+            controls.enabled.checked = floor.enabled;
+            body.style.display = floor.enabled ? "" : "none";
+            for (const key of ["auto_ground", "show_grid", "grid_in_export", "shadows"]) controls[key].checked = floor[key];
+            for (const key of ["style", "shadow_source"]) controls[key].value = floor[key];
+            controls.color.value = floor.color;
+            this.setNumericControlValue(controls.height, clampFloorHeight(floor.height ?? 0));
+            this.setNumericControlValue(controls.shadow_opacity, floor.shadow_opacity);
+            controls.grid_in_export.disabled = !floor.show_grid;
+            controls.shadow_opacity.disabled = !floor.shadows;
+            controls.shadow_source.disabled = !floor.shadows;
+        };
+        this.syncFloorControls();
+        parent.appendChild(section.el);
+        this.hideSectionInUniCanvas(section);
+        return section;
     }
 
     applyDirectionalSkydomeSetting() {
@@ -14284,6 +14563,7 @@ class PoseStudioWidget {
                     this.syncPromptFieldToActiveTab();
                     this.updateRotationSliders();
                     this.commitViewerPoseToCurrentEditor();
+                    this.autoGroundCharacters([this.activeCharacterId]);
                 }
             }
         } catch (err) {
@@ -16778,6 +17058,8 @@ class PoseStudioWidget {
 
             if (data.export) {
                 this.exportParams = { ...this.exportParams, ...data.export };
+                // Workflows saved before the floor existed load with it disabled.
+                this.exportParams.floor = normalizeFloorSettings(data.export.floor);
                 delete this.exportParams.debugPortraitMode;
                 this.setExportCaptureLens({
                     fov_deg: data.export.cam_fov_deg,
@@ -16813,6 +17095,7 @@ class PoseStudioWidget {
             }
             this.viewer?.setUseHandControlPopover?.(this.exportParams.hand_controls_v2 !== false);
             this.applyDirectionalSkydomeSetting();
+            this.applyFloorSetting();
             if (this.updateOverrideBtn) this.updateOverrideBtn();
 
             if (Array.isArray(data.characters) && data.characters.length > MAX_POSE_STUDIO_CHARACTERS) {
@@ -17528,6 +17811,7 @@ app.registerExtension({
             this._vnccsSetCameraPromptInputDisabled = (disabled) => setCameraPromptInputDisabled(this, disabled);
             this._vnccsEnsurePoseImageInput();
             this.studioWidget.applyDirectionalSkydomeSetting();
+            this.studioWidget.applyFloorSetting();
 
             const studioDOMWidget = this.addDOMWidget("pose_studio_ui", "ui", this.studioWidget.container, {
                 serialize: false,

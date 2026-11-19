@@ -4,6 +4,7 @@ import { gunzipSync } from "node:zlib";
 import * as THREE from "../../web/vendor/three/three.module.js";
 import { PoseViewerCore } from "../../web/pose_studio/core.js";
 import * as characters from "../../web/pose_studio/characters.mjs";
+import * as floor from "../../web/pose_studio/floor.mjs";
 import { CHARACTER_POSITION_LIMITS, clampCharacterPosition, modelRotationQuaternion, wrapDegrees } from "../../web/pose_studio/character_transform.mjs";
 import * as animation from "../../web/pose_studio/animation.mjs";
 import { HAND_PRESETS } from "../../web/pose_studio/hand_presets.js";
@@ -59,7 +60,7 @@ export class Element {
 export function createScene({ skinned = false } = {}) {
     const frames = new Map(), timers = new Map(); let id = 0;
     const document = { createElement: tag => new Element(tag), createDocumentFragment: () => new Element(), body: new Element(), activeElement: null };
-    const context = { ...characters, ...animation, ...openpose, CHARACTER_POSITION_LIMITS, clampCharacterPosition,
+    const context = { ...characters, ...floor, ...animation, ...openpose, CHARACTER_POSITION_LIMITS, clampCharacterPosition,
         modelRotationQuaternion, wrapDegrees, isLikelyVideoFile, HAND_PRESETS, console, document, window: {}, Blob,
         getComputedStyle: element => ({ width: `${element.width}px`, height: `${element.height}px` }),
         localStorage: { getItem: () => null, setItem: noop },

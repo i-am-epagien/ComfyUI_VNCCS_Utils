@@ -151,6 +151,7 @@ The right side focuses on prompt, pose library, and lighting:
 - Per-pose prompt text.
 - Collapsed-by-default Characters scene panel.
 - Lighting setup.
+- Floor section (ground plane, grid, contact shadows, Snap to Floor).
 - Ambient, directional, and point light controls.
 - Light position/radar controls.
 - Lighting prompt generation state.
@@ -389,6 +390,43 @@ Lighting behavior is controlled separately:
   preserved and random light generation is skipped.
 - `Keeping Original Lighting` takes precedence and is preserved as part of the
   manual lighting state.
+
+## Floor and Ground Contact
+
+The **Floor** section in the right panel adds a ground plane to the viewport and
+to exported images. It is off by default, and workflows saved before it existed
+load with it off.
+
+Pose Studio frames a capture by moving and scaling the characters in front of a
+fixed capture camera. The floor is a fixed plane in that stage, so putting a
+character on it changes the character's vertical position, not the camera.
+
+- **Show Floor**: turns the floor on. The first time, the floor is placed at
+  the lowest point of all characters so it never cuts through a body.
+- **Height**: moves the floor live while you drag.
+- **To Feet**: moves the floor to the lowest point of all characters.
+- **Snap** / **Snap All**: moves the selected character, or every character,
+  so its lowest drawn point rests on the floor. Ground contact is measured on
+  the drawn vertices of the posed, skinned mesh, so a kneeling pose rests on
+  its knee rather than on its rest-pose soles. In Image mode the result is
+  stored in the current pose tab and one Undo step reverts it. In Animation
+  mode it is keyed at the current frame when Auto-Key is on.
+- **Auto-ground new poses**: snaps a character after a Pose Library pose is
+  loaded onto it and when a character is added. Many library poses were saved
+  floating above the rig's rest-pose floor; this puts them down.
+- **Surface**: *Solid color* draws an unlit floor in the chosen **Color**;
+  *Shadows only* draws only the contact shadows over the export background.
+- **Grid**: a 5-unit grid that is an editor helper; enable **Grid in Export**
+  to include it in captures.
+- **Shadows**, **Shadow Strength**, **Shadow Direction**: contact shadows from
+  the characters. *Overhead* gives grounded contact shadows; *Key light* follows
+  the first directional light. Shadows use a dedicated light that only the floor
+  reads, so they never change how the characters are lit or the
+  `lighting_prompt`.
+
+The floor is hidden when the camera is below it (a positive Pitch that drops
+the camera under the floor). It is not available inside UniCanvas, where the
+mannequin is placed over an existing image.
 
 ## Pose Library
 
