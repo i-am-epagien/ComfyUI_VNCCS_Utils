@@ -1402,6 +1402,8 @@ export class PoseViewerCore {
         if (this.renderer) {
             this.floor?.dispose();
             this.floor = null;
+            this._maskMaterials?.forEach(material => material.dispose());
+            this._maskMaterials = null;
             this.renderer.dispose();
             if (this.renderer.domElement && this.renderer.domElement.parentNode) {
                 // Don't modify the shell's DOM, just clean up WebGL
@@ -5980,6 +5982,52 @@ export class PoseViewerCore {
         }
     }
 
+    /**
+     * Visible-pixel masks for every character, packed three per RGB image:
+     * the n-th character in `order` is channel n % 3 of pack floor(n / 3).
+     * Every character is drawn unlit; characters outside the current pack are
+     * drawn black so they still occlude. Antialiased edges give soft masks,
+     * and pixels shared at an overlap split between the two channels.
+     *
+     * `order` lists character keys: null for the active character, otherwise
+     * a passive character id. Returns PNG data URLs, one per pack.
+     */
+    captureCharacterMaskPacks(width, height, zoom, offsetX = 0, offsetY = 0, yawDeg = 0, pitchDeg = 0, order = [null]) {
+        if (!this.initialized || !this.THREE) return [];
+        const THREE = this.THREE;
+        if (!this._maskMaterials) {
+            this._maskMaterials = ["#ff0000", "#00ff00", "#0000ff", "#000000"].map(color => new THREE.MeshBasicMaterial({
+                color,
+                toneMapped: false,
+                side: THREE.DoubleSide,
+            }));
+        }
+        const meshFor = key => (key == null
+            ? this.skinnedMesh
+            : this.passiveCharacters?.get(String(key))?.mesh) || null;
+        const meshes = order.map(meshFor);
+        const all = this._characterMeshes();
+        const original = new Map(all.map(mesh => [mesh, mesh.material]));
+        const black = this._maskMaterials[3];
+        const packs = [];
+        try {
+            for (let start = 0; start < order.length; start += 3) {
+                for (const mesh of all) mesh.material = black;
+                for (let channel = 0; channel < 3 && start + channel < order.length; channel += 1) {
+                    const mesh = meshes[start + channel];
+                    if (mesh) mesh.material = this._maskMaterials[channel];
+                }
+                const pack = this.capture(width, height, zoom, [0, 0, 0], offsetX, offsetY, yawDeg, pitchDeg, { maskPass: true });
+                if (typeof pack !== "string" || !pack) throw new Error("Character mask capture failed.");
+                packs.push(pack);
+            }
+        } finally {
+            for (const [mesh, material] of original) mesh.material = material;
+            this.requestRender();
+        }
+        return packs;
+    }
+
     renderInteractionOverlay() {
         if (!this.initialized || !this.renderer) return;
         const hidden = [this.skinnedMesh, this.gridHelper, this.captureFrame, this.refPlane, this.floor?.group,
@@ -6057,6 +6105,12 @@ export class PoseViewerCore {
                 bgColor[0] / 255, bgColor[1] / 255, bgColor[2] / 255
             );
         }
+        // Character mask passes render only the characters, flat, on black.
+        const maskHidden = options.maskPass
+            ? [this.floor?.group, this.directionalSkydome, this.refPlane].filter(Boolean)
+            : [];
+        const maskHiddenVisibility = maskHidden.map(item => item.visible);
+        maskHidden.forEach(item => { item.visible = false; });
 
         let dataURL = null;
         const ownsCaptureBatch = !this._captureBatch;
@@ -6083,6 +6137,7 @@ export class PoseViewerCore {
         } finally {
             // Restore state
             this.scene.background = oldBg;
+            maskHidden.forEach((item, index) => { item.visible = maskHiddenVisibility[index]; });
 
             this.jointMarkers.forEach(m => m.visible = markersVisible && this._shouldMarkerBeVisible(m));
             if (this.transform) this.transform.visible = transformVisible;

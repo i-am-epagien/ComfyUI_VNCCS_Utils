@@ -244,7 +244,8 @@ class PoseOutputLimitTests(unittest.TestCase):
         self.assertEqual(len(stack_calls[0][0]), 2)
         self.assertIs(result[0], batch)
         self.assertEqual(result[1], ["first", "second"])
-        self.assertEqual(node.OUTPUT_IS_LIST, (False, True))
+        self.assertEqual(result[2].shape, (1, 3, 2), "Animation mode returns one empty character mask")
+        self.assertEqual(node.OUTPUT_IS_LIST, (False, True, False))
 
     def test_pose_image_dimensions_use_comfyui_height_width_order(self):
         image = types.SimpleNamespace(shape=(1, 768, 1344, 3))

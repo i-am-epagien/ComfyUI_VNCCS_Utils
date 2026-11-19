@@ -41,6 +41,7 @@ Outputs:
 | --- | --- | --- |
 | `images` | `IMAGE` list | Rendered pose image output. In LIST mode it is one image per pose tab. In GRID mode it is a one-item list containing the grid image. |
 | `lighting_prompt` | `STRING` list | Combined lighting, per-pose, and connected camera prompt aligned with `images`. |
+| `character_masks` | `MASK` list | One mask batch per item of `images`, with one mask per character in slot order (Main Character first). Rendered only while this output is connected. See [Character Masks](#character-masks). |
 
 Important backend behavior:
 
@@ -232,6 +233,31 @@ returns to **Pose**, and the Transform fields are read-only. This leaves
 animation keys unchanged; use the Model Rotation and position keys on the
 timeline there. The gizmo is not shown when Pose Studio is embedded in
 UniCanvas, which places the mannequin itself.
+
+## Character Masks
+
+The `character_masks` output gives each character's **visible pixels** in the
+exported image, so a multi-character workflow can treat each figure
+separately: mask conditioning per character, or inpainting each figure with
+its own identity reference in a second pass.
+
+- Each item is a `MASK` batch `[characters, height, width]` aligned with the
+  matching `images` item. Masks are in slot order: index 1 is the Main
+  Character, then Character 2, 3 and 4, as numbered in the Characters panel.
+- Use **VNCCS Pose Character Mask** (`VNCCS_PoseCharacterMask`) to pick one:
+  set `character` to 1-4. A character that is not in the scene gives an empty
+  mask.
+- Masks follow occlusion: where one character is in front of another, the
+  pixels belong to the one in front. Antialiased edges are soft, and an edge
+  pixel shared by two characters is split between them.
+- Masks show the characters only. The floor, its shadows, the Directional
+  Skydome and the background never appear in a mask, and they never hide a
+  character in one.
+- In GRID mode the masks are laid out in the same grid as the image.
+- Masks cost one extra render per pose for up to three characters (two for
+  four), so Pose Studio renders them only while `character_masks` is
+  connected. When it is not connected, the output is empty masks.
+- Animation mode does not render masks yet; the output is one empty mask.
 
 ## Pose Tabs
 

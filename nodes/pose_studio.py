@@ -26,6 +26,8 @@ _CAPTURED_IMAGE_MAX_BYTES = 32 * 1024 * 1024
 _CAPTURED_IMAGE_MAX_PIXELS = 4096 * 4096
 _CAPTURED_IMAGE_MAX_TOTAL_PIXELS = 64 * 1024 * 1024
 _POSE_OUTPUT_MAX_PIXELS = 4096 * 4096
+_MAX_POSE_STUDIO_CHARACTERS = 4
+_CHARACTER_MASK_CHANNELS = 3
 
 _CAMERA_AZIMUTH_PHRASES = (
     ("front-right quarter view", "from a front-right three-quarter angle"),
@@ -142,6 +144,75 @@ def _decode_captured_images(captured_images):
     return rendered_images
 
 
+def _scene_character_count(data):
+    characters = data.get("characters") if isinstance(data, dict) else None
+    if isinstance(characters, list) and characters:
+        return max(1, min(_MAX_POSE_STUDIO_CHARACTERS, len(characters)))
+    return 1
+
+
+def _decode_character_mask_entry(entry, character_count, width, height):
+    """Decode one pose's packed visible-pixel masks into a [C, H, W] float32 array.
+
+    The browser packs three characters per RGB PNG: character n is channel
+    n % 3 of pack n // 3, in slot order. Returns None when the entry is
+    missing or does not match this capture, so the caller can fall back to
+    empty masks instead of returning masks for a different render.
+    """
+    if not isinstance(entry, dict):
+        return None
+    packs = entry.get("packs")
+    needed = (character_count + _CHARACTER_MASK_CHANNELS - 1) // _CHARACTER_MASK_CHANNELS
+    if not isinstance(packs, list) or len(packs) != needed:
+        return None
+    images = _decode_captured_images(packs)
+    if any(image.size != (width, height) for image in images):
+        return None
+    masks = np.zeros((character_count, height, width), dtype=np.float32)
+    for index in range(character_count):
+        pack = np.asarray(images[index // _CHARACTER_MASK_CHANNELS], dtype=np.float32)
+        masks[index] = pack[:, :, index % _CHARACTER_MASK_CHANNELS] / 255.0
+    return masks
+
+
+def _character_mask_arrays(data, sizes):
+    """One [C, H, W] mask array per captured image; zeros where unavailable."""
+    character_count = _scene_character_count(data)
+    entries = data.get("character_masks") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    arrays = []
+    missing = 0
+    for index, (width, height) in enumerate(sizes):
+        entry = entries[index] if index < len(entries) else None
+        masks = _decode_character_mask_entry(entry, character_count, width, height)
+        if masks is None:
+            missing += 1
+            masks = np.zeros((character_count, height, width), dtype=np.float32)
+        arrays.append(masks)
+    # The browser renders masks only while the output is connected; an empty
+    # list means nobody asked for them, so stay quiet.
+    if missing and entries:
+        print(
+            f"[VNCCS Pose Studio] character_masks: {missing} of {len(sizes)} pose(s) had no matching "
+            "browser masks; returning empty masks for them."
+        )
+    return arrays
+
+
+def _grid_character_masks(mask_arrays, columns):
+    """Lay out per-pose [C, H, W] masks like _make_grid lays out the images."""
+    count = len(mask_arrays)
+    character_count, height, width = mask_arrays[0].shape
+    cols = min(_positive_int(columns, "grid_columns", 1), count)
+    rows = (count + cols - 1) // cols
+    grid = np.zeros((character_count, height * rows, width * cols), dtype=np.float32)
+    for index, masks in enumerate(mask_arrays):
+        row, col = divmod(index, cols)
+        grid[:, row * height:(row + 1) * height, col * width:(col + 1) * width] = masks
+    return grid
+
+
 def _animation_frame_rate(data):
     animation = data.get("animation", {}) if isinstance(data, dict) else {}
     try:
@@ -242,9 +313,15 @@ class VNCCS_PoseStudio:
     # The first socket is narrowed to IMAGE or VIDEO by the frontend according
     # to editor_mode and the animation image-batch setting. Keeping the backend
     # union makes every workflow variant valid during server-side validation.
-    RETURN_TYPES = ("IMAGE,VIDEO", "STRING")
-    RETURN_NAMES = ("images", "lighting_prompt")
-    OUTPUT_IS_LIST = (True, True)
+    RETURN_TYPES = ("IMAGE,VIDEO", "STRING", "MASK")
+    RETURN_NAMES = ("images", "lighting_prompt", "character_masks")
+    OUTPUT_IS_LIST = (True, True, True)
+    OUTPUT_TOOLTIPS = (
+        None,
+        None,
+        "Per pose: one visible-pixel mask per character in slot order (Main Character first). "
+        "Use VNCCS Pose Character Mask to pick one. Image mode only; empty in Animation mode.",
+    )
     FUNCTION = "generate"
     CATEGORY = "VNCCS/pose"
     
@@ -553,7 +630,7 @@ class VNCCS_PoseStudio:
         # lists. This instance-level flag is read by the executor after
         # generate() returns, while the legacy image-mode LIST output keeps the
         # class-level list contract.
-        self.OUTPUT_IS_LIST = (not animation_outputs_image_batch, True)
+        self.OUTPUT_IS_LIST = (not animation_outputs_image_batch, True, not animation_outputs_image_batch)
             
         # === 1. Try Client-Side Rendered Images (CSR) ===
         # If frontend sent captured images, use them directly.
@@ -590,9 +667,11 @@ class VNCCS_PoseStudio:
                     tensors.append(torch.from_numpy(np_img))
 
                 if editor_mode == "animation":
+                    # Per-character masks are rendered for Image mode only.
+                    empty_mask = torch.from_numpy(np.zeros((1, view_height, view_width), dtype=np.float32))
                     frame_batch = torch.stack(tensors, dim=0)
                     if animation_outputs_image_batch:
-                        return (frame_batch, lighting_prompts)
+                        return (frame_batch, lighting_prompts, empty_mask)
                     video = _create_comfy_video(
                         frame_batch,
                         _animation_frame_rate(data),
@@ -600,12 +679,15 @@ class VNCCS_PoseStudio:
                     # OUTPUT_IS_LIST stays enabled for the image-mode contract.
                     # A one-item list still supplies one ordinary VIDEO value to
                     # downstream nodes while LIST images retain their old behavior.
-                    return ([video], lighting_prompts)
+                    return ([video], lighting_prompts, [empty_mask])
                 
+                mask_arrays = _character_mask_arrays(data, [img.size for img in rendered_images])
+
                 if output_mode == "LIST":
                     # Return list of individual images and prompts
                     tensor_list = [t.unsqueeze(0) for t in tensors]
-                    return (tensor_list, lighting_prompts)
+                    mask_list = [torch.from_numpy(masks) for masks in mask_arrays]
+                    return (tensor_list, lighting_prompts, mask_list)
                 else:
                     grid_img = self._make_grid(rendered_images, grid_columns, tuple(bg_color))
                     np_grid = np.array(grid_img).astype(np.float32) / 255.0
@@ -614,7 +696,8 @@ class VNCCS_PoseStudio:
                     
                     # For grid, return only the first prompt (conceptually the "main" prompt)
                     combined_prompt = lighting_prompts[0] if lighting_prompts else ""
-                    return ([grid_tensor], [combined_prompt])
+                    mask_grid = torch.from_numpy(_grid_character_masks(mask_arrays, grid_columns))
+                    return ([grid_tensor], [combined_prompt], [mask_grid])
 
         raise RuntimeError(
             "Pose Studio did not receive images rendered by the browser widget. "
@@ -644,11 +727,51 @@ class VNCCS_PoseStudio:
         return grid
 
 
+def _select_character_mask(masks, character):
+    """Pick character `character` (1-based) from a [C, H, W] batch as [1, H, W]."""
+    shape = tuple(masks.shape)
+    if len(shape) == 2:
+        masks = masks.reshape((1,) + shape)
+        shape = tuple(masks.shape)
+    index = int(character) - 1
+    if 0 <= index < shape[0]:
+        return masks[index:index + 1]
+    print(f"[VNCCS Pose Studio] Character {character} is not in the scene ({shape[0]} character(s)); returning an empty mask.")
+    return masks[:1] * 0
+
+
+class VNCCS_PoseCharacterMask:
+    """Select one character's mask from Pose Studio's character_masks output."""
+
+    CATEGORY = "VNCCS/pose"
+    FUNCTION = "select"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    DESCRIPTION = (
+        "Pick one character's visible-pixel mask from VNCCS Pose Studio. "
+        "Character 1 is the Main Character; numbers follow the character slots."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "character_masks": ("MASK",),
+                "character": ("INT", {"default": 1, "min": 1, "max": _MAX_POSE_STUDIO_CHARACTERS, "step": 1}),
+            }
+        }
+
+    def select(self, character_masks, character=1):
+        return (_select_character_mask(character_masks, character),)
+
+
 # Node mappings
 NODE_CLASS_MAPPINGS = {
-    "VNCCS_PoseStudio": VNCCS_PoseStudio
+    "VNCCS_PoseStudio": VNCCS_PoseStudio,
+    "VNCCS_PoseCharacterMask": VNCCS_PoseCharacterMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VNCCS_PoseStudio": "VNCCS Pose Studio"
+    "VNCCS_PoseStudio": "VNCCS Pose Studio",
+    "VNCCS_PoseCharacterMask": "VNCCS Pose Character Mask",
 }

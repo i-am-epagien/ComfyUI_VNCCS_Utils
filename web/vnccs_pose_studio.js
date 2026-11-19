@@ -10,7 +10,7 @@ import {
     POSE_STUDIO_CAPTURE_FOV,
     PoseViewerCore,
     buildEquivalentPerspectiveProjectionFrame,
-} from "./pose_studio/core.js?v=20261119.2";
+} from "./pose_studio/core.js?v=20261119.3";
 import {
     cameraPromptToSkydomeRotation,
 } from "./camera_control/utils.mjs";
@@ -7641,6 +7641,8 @@ class PoseStudioWidget {
         this.exportParams.floor = normalizeFloorSettings({ ...this.floorSettings, ...patch });
         this.applyFloorSetting();
         this.syncToNode(false, { skipCapture: true });
+        // First enable: place the floor under the characters instead of through them.
+        if (patch.enabled === true && this.floorSettings.height == null) this.fitFloorToCharacters();
     }
 
     /** Move the floor to the lowest point of all characters. */
@@ -7808,11 +7810,7 @@ class PoseStudioWidget {
             "Show Floor",
             "Adds a ground plane with contact shadows to the viewport and exported images.",
             "enabled",
-            (enabled) => {
-                this.updateFloorSettings({ enabled });
-                // First enable: place the floor under the characters instead of through them.
-                if (enabled && this.floorSettings.height == null) this.fitFloorToCharacters();
-            },
+            (enabled) => this.updateFloorSettings({ enabled }),
         ));
 
         const body = document.createElement("div");
@@ -8152,6 +8150,64 @@ class PoseStudioWidget {
     forgetPoseManagerImageMetrics(src) {
         if (!src || !this.managerImageMetrics) return;
         this.managerImageMetrics.delete(src);
+    }
+
+    /** Scene characters in slot order with the viewer key used to find their mesh. */
+    characterMaskOrder() {
+        return [...(this.characters || [])]
+            .sort((left, right) => left.slot - right.slot)
+            .map(character => ({
+                key: character.id === this.activeCharacterId ? null : character.id,
+                slot: character.slot,
+                id: character.id,
+                name: character.name,
+            }));
+    }
+
+    /** Masks cost an extra render per pose, so they are drawn only when used. */
+    characterMasksRequested() {
+        const output = this.node?.outputs?.find(slot => slot?.name === "character_masks");
+        return Array.isArray(output?.links) && output.links.length > 0;
+    }
+
+    /**
+     * Render visible-pixel masks for pose `index` right after its image, with
+     * the same camera. Stored with the capture they belong to, so a later
+     * capture of that pose (preview, Pose Manager card) never travels with
+     * masks from an older render. Image mode only.
+     */
+    capturePoseCharacterMasks(index, width, height, camera, poseCamera, animationMode) {
+        if (!this.poseCharacterMasks) this.poseCharacterMasks = [];
+        this.poseCharacterMasks[index] = null;
+        if (animationMode || !this.viewer?.captureCharacterMaskPacks || !this.characterMasksRequested()) return;
+        const order = this.characterMaskOrder();
+        const packs = this.viewer.captureCharacterMaskPacks(
+            width,
+            height,
+            camera.zoom,
+            camera.offset_x,
+            camera.offset_y,
+            poseCamera.yaw_deg,
+            poseCamera.pitch_deg,
+            order.map(entry => entry.key),
+        );
+        this.poseCharacterMasks[index] = {
+            capture: this.poseCaptures?.[index],
+            characters: order.map(({ slot, id, name }) => ({ slot, id, name })),
+            packs,
+        };
+    }
+
+    /** Mask entries for exactly these captures; null where a pose has none. */
+    characterMasksForCaptures(captures = []) {
+        const entries = captures.map((capture, index) => {
+            const entry = this.poseCharacterMasks?.[index];
+            return entry && entry.capture === capture
+                ? { characters: entry.characters, packs: entry.packs }
+                : null;
+        });
+        // Nothing rendered (output not connected): send none at all.
+        return entries.some(Boolean) ? entries : [];
     }
 
     setPoseCapture(index, capture, requireCapture = false) {
@@ -16665,6 +16721,7 @@ class PoseStudioWidget {
                                 poseCamera.yaw_deg,
                                 poseCamera.pitch_deg,
                             ), true);
+                            this.capturePoseCharacterMasks(i, w, h, currentCaptureCamera, poseCamera, animationMode);
                             this.lightingPrompts[i] = this.generatePromptFromLights(
                                 isOriginalLighting ? [] : captureLights,
                                 debugPrompt,
@@ -16700,6 +16757,7 @@ class PoseStudioWidget {
                                 poseCamera.yaw_deg,
                                 poseCamera.pitch_deg,
                             ), true);
+                            this.capturePoseCharacterMasks(i, w, h, currentCaptureCamera, poseCamera, animationMode);
                             const framePrompt = animationMode
                                 ? String(this.animationState.basePose?.prompt ?? this.getPosePrompt(this.activeTab))
                                 : this.getPosePrompt(i);
@@ -17485,7 +17543,8 @@ app.registerExtension({
                     ? widgetData.animation
                     : widget.buildSceneAnimationCachePayload(),
                 captured_images: capturedImages,
-                lighting_prompts: capturedLightingPrompts
+                lighting_prompts: capturedLightingPrompts,
+                character_masks: widget.characterMasksForCaptures?.(capturedImages) || [],
             };
 
             return api.fetchApi('/vnccs/pose_sync/upload_capture', {
