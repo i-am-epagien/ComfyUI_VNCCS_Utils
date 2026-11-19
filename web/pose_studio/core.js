@@ -6,7 +6,15 @@
 
 
 import { normalizeCaptureLens } from "./animation.mjs?v=20261105.1";
-import { PoseStudioFloor, floorHeightForLowestPoints, lowestSkinnedPointY, normalizeFloorSettings } from "./floor.mjs?v=20261119.1";
+import {
+    PoseStudioFloor,
+    boneSubtreeVertexIndices,
+    floorHeightForLowestPoints,
+    largestSafeFraction,
+    lowestPointOfVertices,
+    lowestSkinnedPointY,
+    normalizeFloorSettings,
+} from "./floor.mjs?v=20261119.2";
 
 // Determine the extension's base URL dynamically to support varied directory names
 const EXTENSION_URL = new URL(".", import.meta.url).toString();
@@ -1551,7 +1559,11 @@ export class PoseViewerCore {
             if (e.value) {
                 // Drag Started: Record state for Undo
                 this.recordState();
+                this._floorRotationAnchor = this.selectedBone && !this.selectedIKEffector
+                    ? this.selectedBone.quaternion.clone()
+                    : null;
             } else {
+                this._floorRotationAnchor = null;
                 // Drag Ended
                 // If dragging an IK effector, do final IK solve
                 if (this.selectedIKEffector && this.transform.mode === 'translate') {
@@ -1583,6 +1595,10 @@ export class PoseViewerCore {
                 // Pole target moved - solve IK for this chain
                 this.solveIKForPoleTarget();
             } else if (this.selectedBone) {
+                if (this.transform.mode === 'rotate' && this._floorRotationAnchor) {
+                    this._constrainBoneRotationToFloor(this.selectedBone, this._floorRotationAnchor);
+                    this._floorRotationAnchor.copy(this.selectedBone.quaternion);
+                }
                 // FK rotation - update all effector positions to follow bones
                 this.updateIKEffectorPositions();
             }
@@ -1684,6 +1700,88 @@ export class PoseViewerCore {
         if (!shadows) return;
         const keyLight = (this.lights || []).find(light => light?.isDirectionalLight && light.intensity > 0);
         this.floor.updateShadowFrame(this._characterMeshes(), keyLight?.position || null);
+    }
+
+    // === Floor collision (interactive posing only) ===
+
+    _floorCollisionEnabled() {
+        return !!(
+            this.THREE
+            && this.skinnedMesh
+            && this.floor
+            && this.floorSettings?.enabled
+            && this.floorSettings?.collision
+        );
+    }
+
+    /**
+     * Lowest point minus the character's Y. Translation does not change it,
+     * so whole-character moves can be limited without re-skinning per step.
+     */
+    characterGroundClearance(id = null) {
+        const mesh = id == null ? this.skinnedMesh : this.passiveCharacters?.get(String(id))?.mesh;
+        if (!mesh || !this.THREE) return null;
+        const lowest = lowestSkinnedPointY(this.THREE, mesh);
+        return lowest == null ? null : lowest - mesh.position.y;
+    }
+
+    _lowestOfBoneSubtree(bone) {
+        const vertices = boneSubtreeVertexIndices(this.skinnedMesh, bone);
+        return lowestPointOfVertices(this.THREE, this.skinnedMesh, vertices);
+    }
+
+    /**
+     * FK rotation and knee/elbow drags: keep only the part of this frame's
+     * rotation (from `anchor`, the last accepted orientation) that keeps the
+     * bone's limb above the floor. Returns the fraction that was applied.
+     */
+    _constrainBoneRotationToFloor(bone, anchor) {
+        if (!this._floorCollisionEnabled() || !bone || !anchor) return 1;
+        const target = bone.quaternion.clone();
+        const apply = fraction => {
+            bone.quaternion.copy(anchor).slerp(target, fraction);
+            bone.updateMatrixWorld(true);
+        };
+        const fraction = largestSafeFraction(fraction => {
+            apply(fraction);
+            return this._lowestOfBoneSubtree(bone);
+        }, this.floor.height);
+        apply(fraction);
+        this.skeleton?.update();
+        return fraction;
+    }
+
+    /**
+     * Hand/foot IK drags: if the hand or foot ends below the floor, raise the
+     * target by the overlap and solve again, so the handle stops at the floor.
+     */
+    _keepEffectorAboveFloor(chainDef, chainKey, targetPos) {
+        if (!this._floorCollisionEnabled() || chainDef?.isRoot) return;
+        const bone = this.bones?.[chainDef.effector];
+        if (!bone) return;
+        const floorY = this.floor.height;
+        const wantedY = targetPos.y;
+        const bonePosition = new this.THREE.Vector3();
+        for (let pass = 0; pass < 6; pass += 1) {
+            const lowest = this._lowestOfBoneSubtree(bone);
+            if (lowest == null) break;
+            if (lowest < floorY - 1e-4) {
+                // The hand/foot sits `offset` above its lowest vertex. A target
+                // below floor + offset may be out of reach, where nudging it up
+                // changes nothing, so move it straight to the reachable height.
+                bone.getWorldPosition(bonePosition);
+                const minimumY = floorY + Math.max(0, bonePosition.y - lowest);
+                targetPos.y = targetPos.y < minimumY - 1e-4 ? minimumY : targetPos.y + (floorY - lowest);
+            } else if (targetPos.y > wantedY + 1e-4 && lowest > floorY + 1e-3) {
+                // Raised too far (the limb re-bent): lower it back onto the floor.
+                targetPos.y = Math.max(wantedY, targetPos.y - (lowest - floorY));
+            } else {
+                break;
+            }
+            this.selectedIKEffector?.position?.copy(targetPos);
+            this.ikController.solveWithPole(chainDef, this.bones, targetPos, chainKey);
+            this.skeleton?.update();
+        }
     }
 
     _createDirectionalSkydome() {
@@ -2246,8 +2344,10 @@ export class PoseViewerCore {
 
                         // Pivot parent to place midBone perfectly on mouse cursor
                         const analytic = this.ikController.ccdSolver.analyticSolver;
+                        const floorAnchor = rootBone.quaternion.clone();
                         analytic.rotateBoneToPoint(rootBone, midWorld, targetPos, this.THREE);
                         rootBone.updateMatrixWorld(true);
+                        this._constrainBoneRotationToFloor(rootBone, floorAnchor);
                         if (this.skeleton) this.skeleton.update();
 
                         // Snap true IK foot/hand effector target to its new dragged-along position
@@ -2607,6 +2707,7 @@ export class PoseViewerCore {
             if (effectorBone) {
                 // Store foot positions BEFORE moving hip (for leg IK solving)
                 const footPositions = {};
+                const footOrientations = {};
                 if (chainDef.affectedLegs) {
                     for (const legKey of chainDef.affectedLegs) {
                         const legDef = IK_CHAINS[legKey];
@@ -2616,10 +2717,15 @@ export class PoseViewerCore {
                                 const footPos = new this.THREE.Vector3();
                                 footBone.getWorldPosition(footPos);
                                 footPositions[legKey] = footPos;
+                                footOrientations[legKey] = footBone.getWorldQuaternion(new this.THREE.Quaternion());
                             }
                         }
                     }
                 }
+
+                // Floor collision: the body may not go deeper than it already was.
+                const floorCollision = this._floorCollisionEnabled();
+                const previousLowest = floorCollision ? lowestSkinnedPointY(this.THREE, this.skinnedMesh) : null;
 
                 // Get the difference
                 const bonePos = new this.THREE.Vector3();
@@ -2650,19 +2756,50 @@ export class PoseViewerCore {
                         }
                     }
 
-                    for (let pass = 0; pass < 3; pass++) { // Multiple passes
-                        for (const legKey of chainDef.affectedLegs) {
-                            const legDef = IK_CHAINS[legKey];
-                            const footTarget = footPositions[legKey];
+                    const solveLegs = () => {
+                        for (let pass = 0; pass < 3; pass++) { // Multiple passes
+                            for (const legKey of chainDef.affectedLegs) {
+                                const legDef = IK_CHAINS[legKey];
+                                const footTarget = footPositions[legKey];
 
-                            if (legDef && footTarget && this.ikController.getMode(legKey) === 'ik') {
-                                // Solve leg IK to keep foot at original position
-                                this.ikController.solveWithPole(legDef, this.bones, footTarget, legKey);
+                                if (legDef && footTarget && this.ikController.getMode(legKey) === 'ik') {
+                                    // Solve leg IK to keep foot at original position
+                                    this.ikController.solveWithPole(legDef, this.bones, footTarget, legKey);
+                                }
+                            }
+                            // Update matrix world between passes
+                            for (const bone of this.boneList) {
+                                bone.updateMatrixWorld(true);
                             }
                         }
-                        // Update matrix world between passes
-                        for (const bone of this.boneList) {
-                            bone.updateMatrixWorld(true);
+                        if (floorCollision) {
+                            // Planted feet keep their world orientation; otherwise the
+                            // rigid foot pitches toes-first into the floor as the shin tilts.
+                            const parentQuaternion = new this.THREE.Quaternion();
+                            for (const [legKey, orientation] of Object.entries(footOrientations)) {
+                                const footBone = this.bones[IK_CHAINS[legKey].effector];
+                                if (!footBone?.parent) continue;
+                                footBone.parent.getWorldQuaternion(parentQuaternion);
+                                footBone.quaternion.copy(parentQuaternion.invert().multiply(orientation));
+                                footBone.updateMatrixWorld(true);
+                            }
+                        }
+                    };
+                    solveLegs();
+
+                    if (floorCollision) {
+                        // Lowering the hips into the floor sits or kneels the body on it instead.
+                        const limit = Math.min(this.floor.height, previousLowest ?? this.floor.height);
+                        for (let pass = 0; pass < 2; pass += 1) {
+                            const lowest = lowestSkinnedPointY(this.THREE, this.skinnedMesh);
+                            if (lowest == null || lowest >= limit - 1e-4) break;
+                            const lifted = new this.THREE.Vector3();
+                            effectorBone.getWorldPosition(lifted);
+                            lifted.y += limit - lowest;
+                            if (effectorBone.parent) effectorBone.parent.worldToLocal(lifted);
+                            effectorBone.position.copy(lifted);
+                            effectorBone.updateMatrixWorld(true);
+                            solveLegs();
                         }
                     }
                 }
@@ -2693,6 +2830,7 @@ export class PoseViewerCore {
             if (this.skeleton) {
                 this.skeleton.update();
             }
+            this._keepEffectorAboveFloor(chainDef, chainKey, targetPos);
 
             // Update skinnedMesh matrix
             if (this.skinnedMesh) {

@@ -10,7 +10,7 @@ import {
     POSE_STUDIO_CAPTURE_FOV,
     PoseViewerCore,
     buildEquivalentPerspectiveProjectionFrame,
-} from "./pose_studio/core.js?v=20261119.1";
+} from "./pose_studio/core.js?v=20261119.2";
 import {
     cameraPromptToSkydomeRotation,
 } from "./camera_control/utils.mjs";
@@ -43,7 +43,8 @@ import {
     clampFloorHeight,
     groundingDeltaY,
     normalizeFloorSettings,
-} from "./pose_studio/floor.mjs?v=20261119.1";
+    floorMoveLimit,
+} from "./pose_studio/floor.mjs?v=20261119.2";
 import {
     MAX_VIDEO_POSE_SAMPLES,
     canvasToBlob,
@@ -6755,7 +6756,7 @@ class PoseStudioWidget {
 
     constrainCharacterPosition(position, members = this.linkedPassiveCharacters().map(character => this.passiveCharacterPosition(character))) {
         const next = clampCharacterPosition(position);
-        if (!members.length) return next;
+        if (!members.length) return this.constrainCharacterPositionToFloor(next, false);
         const active = this.getActiveCharacter().transform;
         for (const axis of ["x", "y", "z"]) {
             const [min, max] = CHARACTER_POSITION_LIMITS[axis];
@@ -6763,6 +6764,33 @@ class PoseStudioWidget {
             const delta = next[axis] - active[axis];
             next[axis] = active[axis] + Math.max(min - Math.min(...positions), Math.min(max - Math.max(...positions), delta));
         }
+        return this.constrainCharacterPositionToFloor(next, true);
+    }
+
+    /**
+     * Floor collision for whole-character moves (Y slider, position pad,
+     * Move gizmo, Re-center): stop a downward move where the lowest moving
+     * character touches the floor. Upward and sideways moves are never changed,
+     * so a character that already intersects the floor does not jump.
+     */
+    constrainCharacterPositionToFloor(next, linked) {
+        const floor = this.floorSettings;
+        const active = this.getActiveCharacter();
+        const viewer = this.viewer;
+        if (!floor.enabled || !floor.collision || !active || !viewer?.isInitialized?.()) return next;
+        const currentY = Number(active.transform?.y);
+        if (!Number.isFinite(currentY) || !(next.y < currentY - 1e-9)) return next;
+        const entries = [{ y: viewer.skinnedMesh?.position?.y, clearance: viewer.characterGroundClearance?.(null) }];
+        if (linked) {
+            for (const character of this.linkedPassiveCharacters()) {
+                entries.push({
+                    y: viewer.passiveCharacters?.get(String(character.id))?.mesh?.position?.y,
+                    clearance: viewer.characterGroundClearance?.(character.id),
+                });
+            }
+        }
+        const limit = floorMoveLimit(entries, viewer.getFloorHeight());
+        if (Number.isFinite(limit) && next.y - currentY < limit) next.y = currentY + limit;
         return next;
     }
 
@@ -7802,6 +7830,12 @@ class PoseStudioWidget {
         body.appendChild(actions);
 
         body.appendChild(checkboxRow(
+            "Floor collision",
+            "Stop limbs and characters at the floor while you pose and move them.",
+            "collision",
+            (collision) => this.updateFloorSettings({ collision }),
+        ));
+        body.appendChild(checkboxRow(
             "Auto-ground new poses",
             "Snap a character to the floor after loading a library pose or adding a character.",
             "auto_ground",
@@ -7840,7 +7874,7 @@ class PoseStudioWidget {
             const floor = this.floorSettings;
             controls.enabled.checked = floor.enabled;
             body.style.display = floor.enabled ? "" : "none";
-            for (const key of ["auto_ground", "show_grid", "grid_in_export", "shadows"]) controls[key].checked = floor[key];
+            for (const key of ["collision", "auto_ground", "show_grid", "grid_in_export", "shadows"]) controls[key].checked = floor[key];
             for (const key of ["style", "shadow_source"]) controls[key].value = floor[key];
             controls.color.value = floor.color;
             this.setNumericControlValue(controls.height, clampFloorHeight(floor.height ?? 0));

@@ -151,7 +151,7 @@ The right side focuses on prompt, pose library, and lighting:
 - Per-pose prompt text.
 - Collapsed-by-default Characters scene panel.
 - Lighting setup.
-- Floor section (ground plane, grid, contact shadows, Snap to Floor).
+- Floor section (ground plane, grid, contact shadows, Snap to Floor, floor collision).
 - Ambient, directional, and point light controls.
 - Light position/radar controls.
 - Lighting prompt generation state.
@@ -411,6 +411,19 @@ character on it changes the character's vertical position, not the camera.
   its knee rather than on its rest-pose soles. In Image mode the result is
   stored in the current pose tab and one Undo step reverts it. In Animation
   mode it is keyed at the current frame when Auto-Key is on.
+- **Floor collision** (on by default): the floor is solid while you pose.
+  - Dragging a hand or foot (gizmo or direct drag) stops it on the floor; the
+    handle stays at the floor while the cursor goes below it.
+  - Lowering the hips sits or kneels the body on the floor instead of sinking
+    it. Feet held by leg IK keep their angle, so they stay flat rather than
+    pitching toes-first into the floor.
+  - Rotating a bone (FK gizmo, or dragging a knee or elbow) stops the limb
+    where it touches the floor.
+  - Moving a whole character down (Y slider, position pad, Move gizmo) stops
+    when its lowest point reaches the floor; linked characters stop together.
+  - Collision only blocks motion *into* the floor. A pose that already
+    intersects it is never pushed out on its own and can always be moved up.
+  - Loading poses, imports, animation playback and Snap are not affected.
 - **Auto-ground new poses**: snaps a character after a Pose Library pose is
   loaded onto it and when a character is added. Many library poses were saved
   floating above the rig's rest-pose floor; this puts them down.

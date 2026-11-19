@@ -6,7 +6,11 @@ import {
     DEFAULT_FLOOR_SETTINGS,
     FLOOR_HEIGHT_LIMITS,
     PoseStudioFloor,
+    boneSubtreeVertexIndices,
     floorHeightForLowestPoints,
+    floorMoveLimit,
+    largestSafeFraction,
+    lowestPointOfVertices,
     groundingDeltaY,
     lowestSkinnedPointY,
     normalizeFloorSettings,
@@ -191,4 +195,77 @@ test("Pose Studio wires the floor into the viewer, capture, and persistence", as
     // Auto-ground runs after library loads and Add Character.
     assert.match(widget, /this\.commitViewerPoseToCurrentEditor\(\);\n\s+this\.autoGroundCharacters\(\[this\.activeCharacterId\]\);/);
     assert.match(widget, /await this\.selectCharacter\(character\.id\);\n\s+this\.autoGroundCharacters\(\[character\.id\]\);/);
+});
+
+test("floor collision is on by default and can be turned off", () => {
+    assert.equal(normalizeFloorSettings({}).collision, true);
+    assert.equal(normalizeFloorSettings({ collision: false }).collision, false);
+});
+
+test("bone subtree vertices cover the bone and its descendants", () => {
+    const { mesh, hip, knee } = createLeg();
+    const all = boneSubtreeVertexIndices(mesh, hip);
+    const shin = boneSubtreeVertexIndices(mesh, knee);
+    assert.equal(all.length, mesh.geometry.attributes.position.count);
+    // Shin vertices are y <= -5 (two per row, rows -5..-10).
+    assert.equal(shin.length, 12);
+    assert.equal(boneSubtreeVertexIndices(mesh, knee), shin, "cached per bone");
+    close(lowestPointOfVertices(THREE, mesh, shin), -10, "shin lowest");
+});
+
+test("largest safe fraction stops a motion at the floor", () => {
+    // Lowest point moves linearly from 0 down to -10; the floor is at -4.
+    const evaluate = t => -10 * t;
+    close(largestSafeFraction(evaluate, -4), 0.4, "stops at contact", 0.01);
+    assert.equal(largestSafeFraction(evaluate, -20), 1, "never touches");
+    // Already 2 below the floor: may not go deeper, may come back up.
+    assert.ok(largestSafeFraction(t => -6 - 4 * t, -4) < 0.01, "no deeper");
+    assert.equal(largestSafeFraction(t => -6 + 4 * t, -4), 1, "moving up is free");
+});
+
+test("FK rotation into the floor stops at contact", () => {
+    const { mesh, hip } = createLeg();
+    const floorY = -8;
+    const anchor = hip.quaternion.clone();
+    const target = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
+    // The hanging leg's sole (-10) starts below the floor; swinging it up to
+    // horizontal moves it out of the floor, so the whole rotation is allowed.
+    const up = largestSafeFraction(t => {
+        hip.quaternion.copy(anchor).slerp(target, t);
+        return lowestPointOfVertices(THREE, mesh, boneSubtreeVertexIndices(mesh, hip));
+    }, floorY);
+    assert.equal(up, 1);
+
+    // Starting horizontal (sole at y=0), swinging down stops on the floor.
+    hip.quaternion.copy(target);
+    const fromHorizontal = hip.quaternion.clone();
+    const fraction = largestSafeFraction(t => {
+        hip.quaternion.copy(fromHorizontal).slerp(new THREE.Quaternion(), t);
+        return lowestPointOfVertices(THREE, mesh, boneSubtreeVertexIndices(mesh, hip));
+    }, floorY);
+    hip.quaternion.copy(fromHorizontal).slerp(new THREE.Quaternion(), fraction);
+    close(lowestPointOfVertices(THREE, mesh, boneSubtreeVertexIndices(mesh, hip)), floorY, "leg rests on the floor", 0.05);
+});
+
+test("whole-character moves stop where the lowest character touches", () => {
+    // Both lowest points are at -7 (y + clearance): the group may drop 3.
+    close(floorMoveLimit([{ y: 0, clearance: -7 }, { y: 2, clearance: -9 }], -10), -3);
+    // Lowest points at -7 and -9: the lower one stops the group after 1.
+    close(floorMoveLimit([{ y: 0, clearance: -7 }, { y: 0, clearance: -9 }], -10), -1);
+    // A character already below the floor blocks any further drop.
+    assert.equal(floorMoveLimit([{ y: 0, clearance: -12 }], -10), 0);
+    assert.equal(floorMoveLimit([], -10), -Infinity);
+});
+
+test("Pose Studio wires floor collision into every posing path", async () => {
+    const core = await fs.readFile(new URL("../web/pose_studio/core.js", import.meta.url), "utf8");
+    const widget = await fs.readFile(new URL("../web/vnccs_pose_studio.js", import.meta.url), "utf8");
+    assert.match(core, /this\._keepEffectorAboveFloor\(chainDef, chainKey, targetPos\);/);
+    assert.match(core, /this\._constrainBoneRotationToFloor\(this\.selectedBone, this\._floorRotationAnchor\);/);
+    assert.match(core, /this\._constrainBoneRotationToFloor\(rootBone, floorAnchor\);/);
+    assert.match(core, /Lowering the hips into the floor sits or kneels the body on it instead\./);
+    assert.match(widget, /return this\.constrainCharacterPositionToFloor\(next, true\);/);
+    // core.js and the widget must share one floor module instance.
+    const stamp = text => text.match(/floor\.mjs\?v=([\w.]+)/)[1];
+    assert.equal(stamp(core), stamp(widget));
 });

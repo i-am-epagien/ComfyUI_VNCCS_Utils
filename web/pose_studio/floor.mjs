@@ -32,6 +32,8 @@ export const DEFAULT_FLOOR_SETTINGS = Object.freeze({
     shadow_opacity: 0.45,
     shadow_source: "overhead",
     auto_ground: true,
+    // Keep limbs and characters from being dragged through the floor.
+    collision: true,
 });
 
 const finite = (value, fallback) => {
@@ -71,6 +73,7 @@ export function normalizeFloorSettings(source) {
             ? data.shadow_source
             : DEFAULT_FLOOR_SETTINGS.shadow_source,
         auto_ground: data.auto_ground !== false,
+        collision: data.collision !== false,
     };
 }
 
@@ -121,9 +124,52 @@ export function renderedVertexIndices(geometry) {
  * a few milliseconds) so it follows the current pose.
  */
 export function lowestSkinnedPointY(THREE, mesh) {
+    return lowestPointOfVertices(THREE, mesh, renderedVertexIndices(mesh?.geometry));
+}
+
+const subtreeVertexCache = new WeakMap();
+
+/**
+ * Drawn vertices whose strongest skin weight belongs to `bone` or one of its
+ * descendants: the part of the body that moves when that bone moves.
+ */
+export function boneSubtreeVertexIndices(mesh, bone) {
+    const geometry = mesh?.geometry;
+    const bones = mesh?.skeleton?.bones;
+    const skinIndex = geometry?.attributes?.skinIndex;
+    const skinWeight = geometry?.attributes?.skinWeight;
+    if (!bone || !bones || !skinIndex || !skinWeight) return null;
+    const rendered = renderedVertexIndices(geometry);
+    let perGeometry = subtreeVertexCache.get(geometry);
+    if (!perGeometry || perGeometry.rendered !== rendered || perGeometry.bones !== bones) {
+        perGeometry = { rendered, bones, subtrees: new Map() };
+        subtreeVertexCache.set(geometry, perGeometry);
+    }
+    const cached = perGeometry.subtrees.get(bone);
+    if (cached) return cached;
+
+    const inSubtree = new Uint8Array(bones.length);
+    bone.traverse(child => {
+        const index = bones.indexOf(child);
+        if (index >= 0) inSubtree[index] = 1;
+    });
+    const selected = [];
+    for (const vertex of rendered) {
+        let strongest = 0;
+        for (let slot = 1; slot < 4; slot += 1) {
+            if (skinWeight.getComponent(vertex, slot) > skinWeight.getComponent(vertex, strongest)) strongest = slot;
+        }
+        if (inSubtree[skinIndex.getComponent(vertex, strongest)]) selected.push(vertex);
+    }
+    const result = Uint32Array.from(selected);
+    perGeometry.subtrees.set(bone, result);
+    return result;
+}
+
+/** Lowest world-space Y over the given vertex indices of a skinned mesh. */
+export function lowestPointOfVertices(THREE, mesh, vertices) {
     const position = mesh?.geometry?.attributes?.position;
-    if (!position) return null;
-    const vertices = renderedVertexIndices(mesh.geometry);
+    if (!position || !vertices?.length) return null;
     mesh.updateMatrixWorld(true);
     mesh.skeleton?.update?.();
     const vertex = new THREE.Vector3();
@@ -135,6 +181,47 @@ export function lowestSkinnedPointY(THREE, mesh) {
         if (vertex.y < lowest) lowest = vertex.y;
     }
     return Number.isFinite(lowest) ? lowest : null;
+}
+
+/**
+ * Largest fraction t in [0, 1] of a motion that keeps `evaluate(t)` (the
+ * lowest point after applying fraction t) at or above `limit`.
+ * `evaluate(0)` is the last accepted state. If it is already below the limit
+ * (a pose that started in the floor), the motion may not go any deeper.
+ */
+export function largestSafeFraction(evaluate, limit, { steps = 8, epsilon = 1e-3 } = {}) {
+    // Common case first: the full motion stays above the floor.
+    const end = evaluate(1);
+    if (!Number.isFinite(end) || end >= limit - epsilon) return 1;
+    const start = evaluate(0);
+    if (!Number.isFinite(start)) return 1;
+    const bound = Math.min(limit, start) - epsilon;
+    if (end >= bound) return 1;
+    let low = 0;
+    let high = 1;
+    for (let step = 0; step < steps; step += 1) {
+        const middle = (low + high) / 2;
+        if (evaluate(middle) >= bound) low = middle;
+        else high = middle;
+    }
+    return low;
+}
+
+/**
+ * Most negative vertical move allowed for a group of characters that move
+ * together. Each entry is `{ y, clearance }`, where clearance is the lowest
+ * point minus the character's Y (unchanged by translation). A character that
+ * already intersects the floor may not move further down.
+ */
+export function floorMoveLimit(entries = [], floorY) {
+    let limit = -Infinity;
+    for (const entry of entries) {
+        const y = Number(entry?.y);
+        const clearance = Number(entry?.clearance);
+        if (!Number.isFinite(y) || !Number.isFinite(clearance)) continue;
+        limit = Math.max(limit, Math.min(0, Number(floorY) - clearance - y));
+    }
+    return limit;
 }
 
 /** Y offset to add to a character so its lowest point rests on the floor. */
